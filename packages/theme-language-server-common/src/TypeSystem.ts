@@ -14,6 +14,8 @@ import {
   ArrayReturnType,
   DocsetEntry,
   FilterEntry,
+  MetafieldDefinitionMap,
+  MetafieldDefinition,
   ObjectEntry,
   ReturnType,
   SourceCodeType,
@@ -35,6 +37,7 @@ export class TypeSystem {
   constructor(
     private readonly themeDocset: ThemeDocset,
     private readonly getThemeSettingsSchemaForURI: GetThemeSettingsSchemaForURI,
+    private readonly getMetafieldDefinitions: (uri: string) => Promise<MetafieldDefinitionMap>,
   ) {}
 
   async inferType(
@@ -109,9 +112,10 @@ export class TypeSystem {
    * e.g. objectMap['product'] returns the product ObjectEntry.
    */
   public objectMap = async (uri: string, ast: LiquidHtmlNode): Promise<ObjectMap> => {
-    const [objectMap, themeSettingProperties] = await Promise.all([
+    const [objectMap, themeSettingProperties, metafieldObjectMap] = await Promise.all([
       this._objectMap(),
       this.themeSettingProperties(uri),
+      this.metafieldObjectMap(uri),
     ]);
 
     // Here we shallow mutate `settings.properties` to have the properties made
@@ -122,7 +126,20 @@ export class TypeSystem {
         ...(objectMap.settings ?? {}),
         properties: themeSettingProperties,
       },
+      ...metafieldObjectMap,
     };
+
+    if (Object.entries(metafieldObjectMap).length > 0) {
+      for (let group of ['product', 'collection', 'order', 'blog', 'article', 'page', 'shop']) {
+        if (!result[group]) continue;
+
+        let metafieldProperty = result[group].properties?.find((prop) => prop.name === 'metafields');
+
+        if (!metafieldProperty) continue;
+
+        metafieldProperty.return_type = [{ type: `${group}_metafields`, name: '' }];
+      }
+    }
 
     // Deal with sections/file.liquid section.settings by infering the type from the {% schema %}
     if (/[\/\\]sections[\/\\]/.test(uri) && result.section) {
@@ -162,6 +179,66 @@ export class TypeSystem {
 
     return result;
   };
+
+  public async metafieldObjectMap(uri: string): Promise<ObjectMap> {
+    let result: ObjectMap = {};
+
+    const metafieldGroups = await this.getMetafieldDefinitions(uri);
+
+    if (!metafieldGroups) return result;
+
+    for (let [groupName, definitions] of Object.entries(metafieldGroups)) {
+      let metafieldNamespaces = new Map<string, ObjectEntry[]>();
+
+      for (let definition of (definitions as MetafieldDefinition[])) {
+        if (!metafieldNamespaces.has(definition.namespace)) {
+          metafieldNamespaces.set(definition.namespace, []);
+        }
+
+        metafieldNamespaces.get(definition.namespace)!.push({
+          name: definition.name,
+          description: definition.description,
+          return_type: [{ type: 'metafield', name: '' }],
+        });
+      }
+
+      let metafieldGroupProperties: ObjectEntry[] = [];
+
+      for (let [namespace, namespaceProperties] of metafieldNamespaces) {
+        metafieldGroupProperties.push({
+          name: namespace,
+          return_type: [{ type: `${groupName}_metafield_namespace`, name: '' }],
+          access: {
+            global: false,
+            parents: [],
+            template: [],
+          },
+        });
+
+        result[`${groupName}_metafield_namespace`] = {
+          name: `${groupName}_metafield_namespace`,
+          properties: namespaceProperties,
+          access: {
+            global: false,
+            parents: [],
+            template: [],
+          }
+        }
+      }
+
+      result[`${groupName}_metafields`] = {
+        name: `${groupName}_metafields`,
+        properties: metafieldGroupProperties,
+        access: {
+          global: false,
+          parents: [],
+          template: [],
+        },
+      };
+    };
+
+    return result;
+  }
 
   // This is the big one we reuse (memoized)
   private _objectMap = memo(async (): Promise<ObjectMap> => {
