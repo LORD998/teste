@@ -2,7 +2,7 @@ import { URI, Utils } from 'vscode-uri';
 import { AbstractFileSystem, FileTuple, FileType, UriString } from './AbstractFileSystem';
 import { parseJSON } from './json';
 import { join } from './path';
-import { SourceCodeType, Theme, Translations } from './types';
+import { MetafieldCategory, MetafieldDefinitionMap, SourceCodeType, Theme, Translations } from './types';
 import { isError } from './utils';
 
 export const makeFileExists = (fs: AbstractFileSystem) =>
@@ -140,3 +140,35 @@ const ignoredFolders = ['.git', 'node_modules', 'dist', 'build', 'tmp', 'vendor'
 function isIgnored([uri, type]: FileTuple) {
   return type === FileType.Directory && ignoredFolders.some((folder) => uri.endsWith(folder));
 }
+
+export const makeGetMetafieldDefinitions = (fs: AbstractFileSystem) =>
+  async function (rootUri: string): Promise<MetafieldDefinitionMap> {
+    try {
+      const content = await fs.readFile(join(rootUri, '.shopify/metafields.json'));
+      const json = parseJSON(content);
+
+      return (['product', 'collection', 'order', 'blog', 'article', 'page', 'shop'] as MetafieldCategory[]).reduce((definitions, group) => {
+        definitions[group] = json[`${group}MetafieldDefinitions`].nodes.map((node: any) => ({
+          name: node.name,
+          namespace: node.namespace,
+          description: node.description,
+          type: {
+            category: node.type.category,
+            name: node.type.name,
+          },
+        }));
+  
+        return definitions;
+      }, {
+        product: [],
+        collection: [],
+        order: [],
+        blog: [],
+        article: [],
+        page: [],
+        shop: [],
+      } as MetafieldDefinitionMap);
+    } catch(err) {
+      return {} as MetafieldDefinitionMap;
+    }
+  };

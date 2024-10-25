@@ -25,6 +25,7 @@ import {
   LiquidCheck,
   LiquidHtmlNode,
   LiquidSourceCode,
+  MetafieldDefinitionMap,
   Offense,
   Problem,
   Schema,
@@ -74,6 +75,7 @@ export async function check(
     getDefaultTranslations: makeGetDefaultTranslations(fs, theme, rootUri),
     getDefaultSchemaLocale: makeGetDefaultSchemaLocale(fs, rootUri),
     getDefaultSchemaTranslations: makeGetDefaultSchemaTranslations(fs, theme, rootUri),
+    getMetafieldDefinitions: () => Promise.resolve(({} as MetafieldDefinitionMap)),
   };
 
   const { DisabledChecksVisitor, isDisabled } = createDisabledChecksModule();

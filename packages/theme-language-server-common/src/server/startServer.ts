@@ -6,6 +6,8 @@ import {
   makeFileExists,
   makeGetDefaultSchemaTranslations,
   makeGetDefaultTranslations,
+  makeGetMetafieldDefinitions,
+  memo,
   parseJSON,
   path,
   recursiveReadDirectory,
@@ -92,6 +94,11 @@ export function startServer(
     return config.rootUri;
   };
 
+  const getMetafieldDefinitions = memo(async (uri: string) => {
+    const fn = makeGetMetafieldDefinitions(fs);
+    return fn(await findThemeRootURI(uri));
+  });
+
   // These are augmented here so that the caching is maintained over different runs.
   const themeDocset = new AugmentedThemeDocset(remoteThemeDocset);
   const runChecks = debounce(
@@ -170,12 +177,14 @@ export function startServer(
     getSnippetNamesForURI,
     getThemeSettingsSchemaForURI,
     log,
+    getMetafieldDefinitions,
   });
   const hoverProvider = new HoverProvider(
     documentManager,
     themeDocset,
     getTranslationsForURI,
     getThemeSettingsSchemaForURI,
+    getMetafieldDefinitions,
   );
 
   const executeCommandProvider = new ExecuteCommandProvider(
@@ -285,6 +294,9 @@ export function startServer(
     fs.stat.invalidate(uri);
     if (await configuration.shouldCheckOnSave()) {
       runChecks([uri]);
+    }
+    if (uri.endsWith('.shopify/metafields.json')) {
+      getMetafieldDefinitions.clearCache();
     }
   });
 
