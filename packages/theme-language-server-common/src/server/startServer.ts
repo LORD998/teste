@@ -1,3 +1,4 @@
+import { LiquidTag, NamedTags, NodeTypes } from '@shopify/liquid-html-parser';
 import {
   AugmentedThemeDocset,
   FileTuple,
@@ -9,13 +10,19 @@ import {
   parseJSON,
   path,
   recursiveReadDirectory,
+  SourceCodeType,
 } from '@shopify/theme-check-common';
+import { TextEdit } from 'vscode-json-languageservice';
 import {
+  ApplyWorkspaceEditRequest,
   Connection,
   FileOperationRegistrationOptions,
   InitializeResult,
+  Range,
+  RenameFilesParams,
   ShowDocumentRequest,
   TextDocumentSyncKind,
+  WorkspaceEdit,
 } from 'vscode-languageserver';
 import { ClientCapabilities } from '../ClientCapabilities';
 import { CodeActionKinds, CodeActionsProvider } from '../codeActions';
@@ -25,7 +32,7 @@ import { GetSnippetNamesForURI } from '../completions/providers/RenderSnippetCom
 import { DiagnosticsManager, makeRunChecks } from '../diagnostics';
 import { DocumentHighlightsProvider } from '../documentHighlights/DocumentHighlightsProvider';
 import { DocumentLinksProvider } from '../documentLinks';
-import { DocumentManager } from '../documents';
+import { AugmentedSourceCode, DocumentManager } from '../documents';
 import { OnTypeFormattingProvider } from '../formatting';
 import { HoverProvider } from '../hover';
 import { JSONLanguageService } from '../json/JSONLanguageService';
@@ -35,10 +42,102 @@ import { GetTranslationsForURI } from '../translations';
 import { Dependencies } from '../types';
 import { debounce } from '../utils';
 import { VERSION } from '../version';
-import { Configuration } from './Configuration';
+import { visit } from '../visitor';
 import { CachedFileSystem } from './CachedFileSystem';
+import { Configuration } from './Configuration';
 
 const defaultLogger = () => {};
+const isSnippet = (uri: string) => /\bsnippets(\\|\/)[^\\\/]*\.liquid/.test(uri);
+const snippetName = (uri: string) => path.basename(uri, '.liquid');
+
+class RenameHandler {
+  constructor(private connection: Connection, private documentManager: DocumentManager) {}
+
+  async handle(params: RenameFilesParams, fileExists: any) {
+    // If the file is a snippet, then we need to change
+    // {% render 'oldSnippet' %} to
+    // {% render 'newSnippet' %}.
+    // The way we'll do this is by finding all the files that
+    // reference the old snippet and sending applyEdit requests
+    // to the client with a WorkspaceEdit that changes all the references.
+
+    // First, we need to find all the files that reference the old snippet.
+    // First we need a root URI to start from.
+    const rootUri = await findRoot(params.files[0].oldUri, fileExists);
+
+    await this.documentManager.ensureFull(rootUri);
+    const theme = this.documentManager.theme(rootUri, true);
+    const liquidFiles = theme.filter(
+      (file): file is AugmentedSourceCode<SourceCodeType.LiquidHtml> =>
+        file.type === SourceCodeType.LiquidHtml,
+    );
+    const promises = [];
+    for (const file of params.files) {
+      if (isSnippet(file.oldUri) && isSnippet(file.newUri)) {
+        const oldSnippetName = snippetName(file.oldUri);
+        const newSnippetName = snippetName(file.newUri);
+        const workspaceEdit: WorkspaceEdit = {
+          documentChanges: [],
+          changeAnnotations: {
+            renameSnippet: {
+              label: `Renaming snippet ${oldSnippetName} to ${newSnippetName}`,
+              needsConfirmation: false,
+            },
+          },
+        };
+        for (const liquidFile of liquidFiles) {
+          if (liquidFile.ast instanceof Error) continue;
+
+          const textDocument = liquidFile.textDocument;
+          const edits: TextEdit[] = visit<SourceCodeType.LiquidHtml, TextEdit>(liquidFile.ast, {
+            LiquidTag(node: LiquidTag) {
+              if (node.name !== NamedTags.render && node.name !== NamedTags.include) {
+                return;
+              }
+              if (typeof node.markup === 'string') {
+                // TODO
+                return;
+              }
+              const snippet = node.markup.snippet;
+              if (snippet.type === NodeTypes.String && snippet.value === oldSnippetName) {
+                return {
+                  newText: `'${newSnippetName}'`,
+                  range: Range.create(
+                    textDocument.positionAt(snippet.position.start),
+                    textDocument.positionAt(snippet.position.end),
+                  ),
+                };
+              }
+            },
+          });
+
+          if (edits.length === 0) continue;
+          workspaceEdit.documentChanges!.push({
+            edits,
+            textDocument: {
+              uri: textDocument.uri,
+              version: liquidFile.version ?? null,
+            },
+            annotationId: 'renameSnippet',
+          });
+        }
+
+        if (workspaceEdit.documentChanges!.length === 0) {
+          console.error('Nothing to do!');
+          continue;
+        }
+        promises.push(
+          this.connection.sendRequest(ApplyWorkspaceEditRequest.type, {
+            label: `Rename snippet ${oldSnippetName} to ${newSnippetName}`,
+            edit: workspaceEdit,
+          }),
+        );
+      }
+
+      await Promise.all(promises);
+    }
+  }
+}
 
 /**
  * This code runs in node and the browser, it can't talk to the file system
@@ -64,7 +163,7 @@ export function startServer(
   const fileExists = makeFileExists(fs);
   const clientCapabilities = new ClientCapabilities();
   const configuration = new Configuration(connection, clientCapabilities);
-  const documentManager = new DocumentManager();
+  const documentManager = new DocumentManager(fs);
   const diagnosticsManager = new DiagnosticsManager(connection);
   const documentLinksProvider = new DocumentLinksProvider(documentManager);
   const codeActionsProvider = new CodeActionsProvider(documentManager, diagnosticsManager);
@@ -85,6 +184,7 @@ export function startServer(
   const linkedEditingRangesProvider = new LinkedEditingRangesProvider(documentManager);
   const documentHighlightProvider = new DocumentHighlightsProvider(documentManager);
   const renameProvider = new RenameProvider(documentManager);
+  const renameHandler = new RenameHandler(connection, documentManager);
 
   const findThemeRootURI = async (uri: string) => {
     const rootUri = await findRoot(uri, fileExists);
@@ -296,6 +396,7 @@ export function startServer(
 
   connection.onDocumentLinks(async (params) => {
     const { uri } = params.textDocument;
+
     const rootUri = await findThemeRootURI(uri);
     return documentLinksProvider.documentLinks(uri, rootUri);
   });
@@ -362,6 +463,7 @@ export function startServer(
   });
   connection.workspace.onDidRenameFiles((params) => {
     const triggerUris = params.files.map((fileRename) => fileRename.newUri);
+    renameHandler.handle(params, fileExists);
     runChecks.force(triggerUris);
     for (const { oldUri, newUri } of params.files) {
       fs.readDirectory.invalidate(path.dirname(oldUri));

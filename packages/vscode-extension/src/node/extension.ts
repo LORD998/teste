@@ -50,6 +50,10 @@ async function startServer(context: ExtensionContext) {
   }
 
   const clientOptions: LanguageClientOptions = {
+    markdown: {
+      isTrusted: true,
+      supportHtml: true,
+    },
     documentSelector: [
       { language: 'liquid' },
       { language: 'plaintext' },
